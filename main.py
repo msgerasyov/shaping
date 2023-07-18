@@ -93,6 +93,7 @@ def parse_args():
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         env = gym.make(env_id, render_mode='rgb_array')
+        env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
@@ -106,7 +107,6 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayScaleObservation(env)
         env = gym.wrappers.FrameStack(env, 4)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
         env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
@@ -235,7 +235,7 @@ if __name__ == "__main__":
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             for item in info:
-                if "final_info" in item.keys():
+                if "final_info" in item.keys() and "episode" in item["final_info"].keys():
                     return_queue.append(item["final_info"]["episode"]["r"])
                     length_queue.append(item["final_info"]["episode"]["l"])
                     writer.add_scalar("charts/episodic_return", np.mean(return_queue), global_step)
@@ -341,3 +341,8 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    # save the agent
+    torch.save(agent, f"runs/{run_name}/agent.pth")
+    if args.track:
+        wandb.save(f"runs/{run_name}/agent.pth")
