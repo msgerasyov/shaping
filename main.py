@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tqdm
-from stable_baselines3.common.monitor import Monitor
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
@@ -24,6 +23,11 @@ from stable_baselines3.common.atari_wrappers import (  # isort:skip
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+
+try:
+    import miniworld
+except ImportError:
+    pass
 
 
 def parse_args():
@@ -97,7 +101,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        if isinstance(env.unwrapped, shimmy.atari_env.AtariEnv):
+        if hasattr(shimmy, 'atari_env') and isinstance(env.unwrapped, shimmy.atari_env.AtariEnv):
             env = NoopResetEnv(env, noop_max=30)
             env = MaxAndSkipEnv(env, skip=4)
             env = EpisodicLifeEnv(env)
@@ -107,7 +111,8 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayScaleObservation(env)
         env = gym.wrappers.FrameStack(env, 4)
-        env.seed(seed)
+        if hasattr(env, "seed"):
+            env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -180,7 +185,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.AsyncVectorEnv(
+    envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
@@ -336,8 +341,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-        progress.set_description(f"mean reward: {np.mean(return_queue):.2f}, "
-                                 f"fps: {int(global_step / (time.time() - start_time))}")
+        if len(return_queue) > 0:
+            progress.set_description(f"mean reward: {np.mean(return_queue):.2f}, "
+                                    f"fps: {int(global_step / (time.time() - start_time))}")
 
     envs.close()
     writer.close()
