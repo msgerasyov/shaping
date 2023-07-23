@@ -163,3 +163,9 @@ cython_debug/
 runs/
 wandb/
 videos/
+
+# ViZDoom 
+_vizdoom*
+
+# vscode
+.vscode
