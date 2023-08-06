@@ -7,6 +7,7 @@ from collections import deque
 from distutils.util import strtobool
 
 import gymnasium as gym
+import networkx as nx
 import numpy as np
 import shimmy
 import torch
@@ -17,6 +18,8 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 import envs
+from models import GCN
+from utils import create_pyg_data, train_gcn
 
 from stable_baselines3.common.atari_wrappers import (  # isort:skip
     ClipRewardEnv,
@@ -82,8 +85,20 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--stats-window-size", type=int, default=100, 
+    parser.add_argument("--stats-window-size", type=int, default=100,
         help="the number of episodes to average episode length and reward over")
+    parser.add_argument("--gcn-epochs", type=int, default=1,
+        help="number of epochs to train")
+    parser.add_argument("--gcn-lr", type=float, default=1e-3,
+        help="initial learning rate.")
+    parser.add_argument("--gcn-weight_decay", type=float, default=0e-4,
+        help="weight decay (L2 loss on parameters)")
+    parser.add_argument("--gcn-hidden", type=int, default=64,
+        help="number of hidden units of GCN")
+    parser.add_argument("--gcn-alpha", type=float, default=0.8,
+        help="mixing coefficient between TD returns and GCN returns")
+    parser.add_argument("--gcn-lambda", type=float, default=10.,
+        help="mixing coefficient between GCN losses")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -93,12 +108,12 @@ def parse_args():
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make(env_id, render_mode='rgb_array')
+        env = gym.make(env_id, render_mode="rgb_array")
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        if hasattr(shimmy, 'atari_env') and isinstance(env.unwrapped, shimmy.atari_env.AtariEnv):
+        if hasattr(shimmy, "atari_env") and isinstance(env.unwrapped, shimmy.atari_env.AtariEnv):
             env = NoopResetEnv(env, noop_max=30)
             env = MaxAndSkipEnv(env, skip=4)
             env = EpisodicLifeEnv(env)
@@ -149,7 +164,7 @@ class Agent(nn.Module):
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), hidden
 
 
 if __name__ == "__main__":
@@ -192,6 +207,10 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # GNN model and optimizer setup
+    gcn_model = GCN(512, 2, args.gcn_hidden).to(device)
+    gcn_optimizer = optim.Adam(gcn_model.parameters(), lr=args.gcn_lr, weight_decay=args.gcn_weight_decay)
+
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -199,6 +218,9 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    hidden_states = torch.zeros((args.num_steps, args.num_envs, 512)).to(device)
+    gcn_states = [[] for _ in range(args.num_envs)]
+    rew_states = [[] for _ in range(args.num_envs)]
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -226,16 +248,33 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value, hid = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
+            hidden_states[step] = hid
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.array(terminated) | np.array(truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+
+            if args.gcn_alpha < 1.0:
+                for idx, (item, r) in enumerate(zip(info, reward)):
+                    gcn_states[idx].append(hid[idx, :].detach())
+                    episode_done = "final_info" in item.keys() and "episode" in item["final_info"].keys()
+                    if reward[idx] != 0.0 or episode_done:
+                        rew_states[idx].append((len(gcn_states[idx]) - 1, reward[idx]))
+                    if episode_done and len(gcn_states[idx]) > 1:
+                        # update GCN
+                        graph = nx.path_graph(len(gcn_states[idx]))
+                        features = torch.stack(gcn_states[idx])
+                        data = create_pyg_data(graph, features, rew_states[idx]).to(device)
+                        train_gcn(gcn_model, data, gcn_optimizer, args.gcn_lambda, args.gcn_epochs)
+                    if episode_done:
+                        gcn_states[idx] = []
+                        rew_states[idx] = []
 
             for item in info:
                 if "final_info" in item.keys() and "episode" in item["final_info"].keys():
@@ -247,18 +286,30 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            gcn_phi = torch.zeros_like(rewards).to(device)
+            if args.gcn_alpha < 1.0:
+                total_len = hidden_states.size(0) * hidden_states.size(1)
+                graph = nx.from_numpy_array(np.eye(total_len))
+                data = create_pyg_data(graph, hidden_states.view(total_len, -1)).to(device)
+                gcn_phi = torch.exp(gcn_model(data))[:, 1].view(rewards.size(0), rewards.size(1))
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
+            advantages_phi = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
+            gaephi = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
+                    nextphi = next_value
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
+                    nextphi = gcn_phi[t + 1]
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                delta_phi = rewards[t] + args.gamma * nextphi * nextnonterminal - gcn_phi[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                advantages_phi[t] = gaiphi = delta_phi + args.gamma * args.gae_lambda * nextnonterminal * gaephi
             returns = advantages + values
 
         # flatten the batch
@@ -266,6 +317,7 @@ if __name__ == "__main__":
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
+        b_advantages_phi = advantages_phi.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
@@ -278,7 +330,9 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions.long()[mb_inds]
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -289,8 +343,13 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
+                mb_advantages_phi = b_advantages_phi[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages_phi = (mb_advantages_phi - mb_advantages_phi.mean()) / (
+                        mb_advantages_phi.std() + 1e-8
+                    )
+                mb_advantages = (1.0 - args.gcn_alpha) * mb_advantages_phi + args.gcn_alpha * mb_advantages
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -340,8 +399,9 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
         if len(return_queue) > 0:
-            progress.set_description(f"mean reward: {np.mean(return_queue):.2f}, "
-                                    f"fps: {int(global_step / (time.time() - start_time))}")
+            progress.set_description(
+                f"mean reward: {np.mean(return_queue):.2f}, " f"fps: {int(global_step / (time.time() - start_time))}"
+            )
 
     envs.close()
     writer.close()
