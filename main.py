@@ -18,7 +18,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 import envs
-from models import GCN
+from models import GCN, GAT, GraphSAGE
 from utils import create_pyg_data, train_gcn
 
 from stable_baselines3.common.atari_wrappers import (  # isort:skip
@@ -99,6 +99,8 @@ def parse_args():
         help="mixing coefficient between TD returns and GCN returns")
     parser.add_argument("--gcn-lambda", type=float, default=10.,
         help="mixing coefficient between GCN losses")
+    parser.add_argument("--gcn-model", type=str, default="GCN",
+        help="GNN model to use (GCN, GAT or GraphSAGE)")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -208,7 +210,9 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # GNN model and optimizer setup
-    gcn_model = GCN(512, 2, args.gcn_hidden).to(device)
+    gcn_model_class = {"GCN": GCN, "GAT": GAT, "GraphSAGE": GraphSAGE}
+    assert args.gcn_model in gcn_model_class
+    gcn_model = gcn_model_class[args.gcn_model](512, 2, args.gcn_hidden).to(device)
     gcn_optimizer = optim.Adam(gcn_model.parameters(), lr=args.gcn_lr, weight_decay=args.gcn_weight_decay)
 
     # ALGO Logic: Storage setup
